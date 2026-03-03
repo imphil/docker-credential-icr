@@ -41,7 +41,7 @@ thiserror = "2.0.9"
 clap = { version = "4.5.23", features = ["derive"] }
 
 # Random number generation
-rand = "0.8.5"
+rand = "0.10.0"
 
 # Hex encoding
 hex = "0.4.3"
