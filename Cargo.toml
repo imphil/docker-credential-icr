@@ -12,13 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 # HTTP client (using rustls for static linking)
-reqwest = { version = "0.12.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13.2", features = ["json", "blocking", "rustls-tls"], default-features = false }
 
 # Async runtime
 tokio = { version = "1.42.0", features = ["full"] }
 
 # Web server for OAuth callback
-axum = "0.7.9"
+axum = "0.8.8"
 
 # Serialization
 serde = { version = "1.0.217", features = ["derive"] }
@@ -41,7 +41,7 @@ thiserror = "2.0.9"
 clap = { version = "4.5.23", features = ["derive"] }
 
 # Random number generation
-rand = "0.8.5"
+rand = "0.10.0"
 
 # Hex encoding
 hex = "0.4.3"
