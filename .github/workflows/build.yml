@@ -56,7 +56,7 @@ jobs:
       - name: Install dependencies (Linux)
         if: matrix.platform.os == 'ubuntu-latest'
         run: |
-          dnf install -y dbus-devel pkgconf-pkg-config
+          dnf install -y gcc gcc-c++ make dbus-devel pkgconf-pkg-config
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
