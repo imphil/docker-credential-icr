@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # HTTP client (using rustls for static linking)
-reqwest = { version = "0.12.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13.2", features = ["json", "blocking", "rustls-tls"], default-features = false }
 
 # Async runtime
 tokio = { version = "1.42.0", features = ["full"] }
