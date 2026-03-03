@@ -76,7 +76,12 @@ fn build_authorization_url(
 
 /// Generate a random state parameter for CSRF protection
 fn generate_state() -> String {
-    rand::thread_rng().gen_ascii_chars().take(32).collect()
+    use rand::distributions::Alphanumeric;
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
 }
 
 /// Open the authorization URL in the default browser

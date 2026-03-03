@@ -1,14 +1,14 @@
 use crate::error::{CredentialError, Result};
 use axum::{
+    Router,
     extract::Query,
     response::{Html, IntoResponse},
     routing::get,
-    Router,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Deserialize)]

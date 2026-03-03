@@ -3,6 +3,7 @@
 {
 	"name": "docker-credential-icr",
 	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+	"postStartCommand": "apt-get update && apt-get install -y libdbus-1-dev pkg-config",
 
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	"mounts": [
