@@ -14,6 +14,7 @@ jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
     runs-on: ${{ matrix.platform.os }}
+    container: ${{ matrix.platform.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +22,7 @@ jobs:
           # Linux
           - name: Linux x86_64
             os: ubuntu-latest
+            container: almalinux:8
             target: x86_64-unknown-linux-gnu
             artifact_name: docker-credential-icr-linux-x86_64
             binary_name: docker-credential-icr
@@ -68,7 +70,7 @@ jobs:
         run: cargo test --release --target ${{ matrix.platform.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform.artifact_name }}
           path: target/${{ matrix.platform.target }}/release/${{ matrix.platform.binary_name }}
