@@ -14,7 +14,8 @@ jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
     runs-on: ${{ matrix.platform.os }}
-    container: ${{ matrix.platform.container }}
+    container:
+        image: ${{ matrix.platform.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,21 +27,21 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: docker-credential-icr-linux-x86_64
             binary_name: docker-credential-icr
-          
+
           # macOS Intel
           - name: macOS x86_64
             os: macos-26-intel
             target: x86_64-apple-darwin
             artifact_name: docker-credential-icr-macos-x86_64
             binary_name: docker-credential-icr
-          
+
           # macOS Apple Silicon
           - name: macOS ARM64
             os: macos-26
             target: aarch64-apple-darwin
             artifact_name: docker-credential-icr-macos-arm64
             binary_name: docker-credential-icr
-          
+
           # Windows
           - name: Windows x86_64
             os: windows-latest
@@ -50,13 +51,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies (Linux)
         if: matrix.platform.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update
-          sudo apt install -y libdbus-1-dev pkg-config
+          dnf install -y dbus-devel pkgconf-pkg-config
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
