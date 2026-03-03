@@ -1,0 +1,65 @@
+[package]
+name = "docker-credential-icr"
+version = "0.1.0"
+edition = "2024"
+authors = ["Philipp Wagner"]
+description = "Docker credential helper for IBM Cloud Container Registry using OAuth2"
+license = "Apache-2.0"
+
+[[bin]]
+name = "docker-credential-icr"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP client (using rustls for static linking)
+reqwest = { version = "0.12.12", features = ["json", "blocking", "rustls-tls"], default-features = false }
+
+# Async runtime
+tokio = { version = "1.42.0", features = ["full"] }
+
+# Web server for OAuth callback
+axum = "0.7.9"
+
+# Serialization
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+
+# OAuth2 client
+oauth2 = "5.0.0"
+
+# URL handling
+url = "2.5.4"
+
+# Browser launching
+webbrowser = "1.0.2"
+
+# Error handling
+anyhow = "1.0.95"
+thiserror = "2.0.9"
+
+# CLI argument parsing
+clap = { version = "4.5.23", features = ["derive"] }
+
+# Random number generation
+rand = "0.8.5"
+
+# Hex encoding
+hex = "0.4.3"
+
+# Logging
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+# Secure credential storage
+keyring = { version = "3.6.1", features = ["windows-native", "apple-native", "sync-secret-service"] }
+
+# Time handling for token expiration
+chrono = { version = "0.4.39", features = ["serde"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+mockito = "1.6.1"

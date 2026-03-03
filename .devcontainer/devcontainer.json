@@ -1,0 +1,15 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+	"name": "docker-credential-icr",
+	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+
+	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
+	"mounts": [
+		{
+			"source": "devcontainer-cargo-cache-${devcontainerId}",
+			"target": "/usr/local/cargo",
+			"type": "volume"
+		}
+	]
+}
