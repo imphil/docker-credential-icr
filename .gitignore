@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+/.cargo/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+*.pdb
