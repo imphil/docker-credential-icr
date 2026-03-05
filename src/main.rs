@@ -78,10 +78,10 @@ async fn main() {
 }
 
 /// Initialize logging based on DOCKER_CREDENTIAL_ICR_LOG environment variable
-/// Defaults to "warn" if not set
+/// Defaults to "error" if not set
 fn init_logging() {
     let filter = EnvFilter::try_from_env("DOCKER_CREDENTIAL_ICR_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("docker_credential_icr=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("docker_credential_icr=error"));
 
     tracing_subscriber::registry()
         .with(filter)
