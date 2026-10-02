@@ -1,6 +1,8 @@
 use clap::Command;
 use docker_credential_icr::credential::handle_get;
+use std::fs::OpenOptions;
 use std::process;
+use std::sync::Mutex;
 use tokio::signal;
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -72,19 +74,45 @@ async fn main() {
             eprintln!();
             eprintln!("Set DOCKER_CREDENTIAL_ICR_LOG environment variable to control logging:");
             eprintln!("  off, error, warn, info, debug, or trace");
+            eprintln!();
+            eprintln!("Set DOCKER_CREDENTIAL_ICR_LOG_FILE to write logs to a file instead of stderr.");
+            eprintln!("Set DOCKER_CREDENTIAL_ICR_ALLOW_FILE_STORE=1 to enable the file-store fallback");
+            eprintln!("  when the keyring is unavailable (e.g. rootless podman).");
             process::exit(1);
         }
     }
 }
 
-/// Initialize logging based on DOCKER_CREDENTIAL_ICR_LOG environment variable
-/// Defaults to "error" if not set
+/// Initialize logging based on DOCKER_CREDENTIAL_ICR_LOG environment variable.
+/// Defaults to "error" if not set.
+///
+/// If DOCKER_CREDENTIAL_ICR_LOG_FILE is set and the file can be opened for
+/// writing, log output is directed there instead of stderr.
 fn init_logging() {
     let filter = EnvFilter::try_from_env("DOCKER_CREDENTIAL_ICR_LOG")
         .unwrap_or_else(|_| EnvFilter::new("docker_credential_icr=error"));
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .init();
+    // Attempt to open a log file when the env var is set.
+    let log_file = std::env::var("DOCKER_CREDENTIAL_ICR_LOG_FILE")
+        .ok()
+        .and_then(|path| {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .ok()
+        });
+
+    if let Some(file) = log_file {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_writer(Mutex::new(file)))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .init();
+    }
 }

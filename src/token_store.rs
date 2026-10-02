@@ -1,14 +1,53 @@
-//! Token storage module using system keyring for secure credential storage
+//! Token storage module using system keyring for secure credential storage.
 //!
-//! This module provides secure storage for OAuth2 tokens (access and refresh tokens)
-//! using the system's native credential store (Keychain on macOS, Credential Manager
-//! on Windows, Secret Service on Linux).
+//! Tokens are stored in the system keyring (Secret Service on Linux, Keychain
+//! on macOS, Credential Manager on Windows) when available.
+//!
+//! ## Rootless podman fast-path
+//!
+//! Rootless podman spawns credential helpers inside a user namespace where the
+//! process sees itself as uid 0.  The D-Bus session bus rejects connections
+//! from uid 0 (SO_PEERCRED mismatch), causing every keyring call to time out.
+//! Podman signals this situation by setting `_CONTAINERS_USERNS_CONFIGURED=done`
+//! before exec-ing the helper.  When that variable is present the keyring
+//! attempt is skipped entirely, avoiding a multi-second timeout on every pull.
+//!
+//! ## File-store fallback
+//!
+//! When the keyring is unavailable (podman userns or any other D-Bus failure)
+//! the module can fall back to a plain JSON file if
+//! `DOCKER_CREDENTIAL_ICR_ALLOW_FILE_STORE=1` is set:
+//!
+//! - Linux/macOS: `~/.config/docker-credential-icr/tokens/<registry>.json` (mode 0600)
+//! - Windows:     `%APPDATA%\docker-credential-icr\tokens\<registry>.json`
 
 use crate::error::{CredentialError, Result};
 use chrono::{DateTime, Utc};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
+
+/// Returns true when running inside a rootless podman user namespace.
+///
+/// Podman sets `_CONTAINERS_USERNS_CONFIGURED=done` in the environment of
+/// every process it spawns after entering the user namespace.  In that context
+/// the D-Bus session bus is unreachable (SO_PEERCRED uid mismatch), so the
+/// keyring must be skipped to avoid a timeout on every invocation.
+fn inside_podman_userns() -> bool {
+    std::env::var("_CONTAINERS_USERNS_CONFIGURED")
+        .map(|v| v == "done")
+        .unwrap_or(false)
+}
+
+/// Returns true when `DOCKER_CREDENTIAL_ICR_ALLOW_FILE_STORE` is set to any
+/// non-empty value, enabling the plain-file fallback store.
+fn file_store_enabled() -> bool {
+    std::env::var("DOCKER_CREDENTIAL_ICR_ALLOW_FILE_STORE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
 
 const SERVICE_NAME: &str = "docker-credential-icr";
 
@@ -46,7 +85,63 @@ impl StoredToken {
     }
 }
 
-/// Token store for managing OAuth2 tokens in system keyring
+// ---------------------------------------------------------------------------
+// File-based fallback store
+// ---------------------------------------------------------------------------
+
+fn file_store_path(registry: &str) -> Option<PathBuf> {
+    dirs::config_dir().map(|base| {
+        let safe = registry.replace(['/', ':', '@'], "_");
+        base.join("docker-credential-icr")
+            .join("tokens")
+            .join(format!("{}.json", safe))
+    })
+}
+
+fn file_store_read(registry: &str) -> Option<StoredToken> {
+    let path = file_store_path(registry)?;
+    let data = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn file_store_write(registry: &str, token: &StoredToken) -> std::io::Result<()> {
+    let path = file_store_path(registry).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "Cannot determine config dir")
+    })?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string_pretty(token)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    fs::write(&path, json.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
+}
+
+fn file_store_delete(registry: &str) {
+    if let Some(path) = file_store_path(registry) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TokenStore
+// ---------------------------------------------------------------------------
+
+/// Token store for managing OAuth2 tokens.
+///
+/// Tries the system keyring first.  If the keyring is unavailable (e.g.
+/// SELinux blocks D-Bus access when spawned by podman) the module falls back
+/// automatically to a `~/.config` file store with 0600 permissions.
 pub struct TokenStore {
     registry: String,
 }
@@ -57,213 +152,204 @@ impl TokenStore {
         Self { registry }
     }
 
-    /// Get the keyring entry for access token
-    fn get_access_token_entry(&self) -> Result<Entry> {
-        let key = format!("{}-access", self.registry);
-        Entry::new(SERVICE_NAME, &key).map_err(|e| {
-            CredentialError::TokenStoreError(format!("Failed to access keyring: {}", e))
-        })
+    fn access_key(&self) -> String {
+        format!("{}-access", self.registry)
     }
 
-    /// Get the keyring entry for refresh token
-    fn get_refresh_token_entry(&self) -> Result<Entry> {
-        let key = format!("{}-refresh", self.registry);
-        Entry::new(SERVICE_NAME, &key).map_err(|e| {
-            CredentialError::TokenStoreError(format!("Failed to access keyring: {}", e))
-        })
+    fn refresh_key(&self) -> String {
+        format!("{}-refresh", self.registry)
     }
 
-    /// Get the keyring entry for expiration time
-    fn get_expiration_entry(&self) -> Result<Entry> {
-        let key = format!("{}-expires", self.registry);
-        Entry::new(SERVICE_NAME, &key).map_err(|e| {
-            CredentialError::TokenStoreError(format!("Failed to access keyring: {}", e))
-        })
+    fn expires_key(&self) -> String {
+        format!("{}-expires", self.registry)
     }
 
-    /// Store a token in the system keyring
+    /// Store a token — keyring first, file store on any keyring failure.
     pub fn store_token(&self, token: &StoredToken) -> Result<()> {
         info!("Storing tokens for registry: {}", self.registry);
 
-        // Note: IBM Cloud tokens are JWT tokens with around 1600 characters. The Windows Credential
-        // Manager can store up to 2560 bytes of data per credential. Since set_password() encodes
-        // the password as UTF-16 string that means we end up with a maximum of 1280 characters,
-        // which isn't sufficient. Storing the token as bytes using set_secret() works around that
-        // limitation.
-        //
-        // See also CRED_MAX_CREDENTIAL_BLOB_SIZE at
-        // https://learn.microsoft.com/en-us/windows/win32/api/wincred/ns-wincred-credentialw.
-
-        // Store access token
-        let access_entry = self.get_access_token_entry()?;
-        access_entry
-            .set_secret(token.access_token.as_bytes())
-            .map_err(|e| {
-                CredentialError::TokenStoreError(format!("Failed to store access token: {}", e))
+        // Skip the keyring entirely when running inside a rootless podman user
+        // namespace — the D-Bus session bus is unreachable there and every
+        // keyring call would block until timeout.
+        if inside_podman_userns() {
+            debug!("Inside podman userns: skipping keyring, going straight to file store");
+            if !file_store_enabled() {
+                return Err(CredentialError::TokenStoreError(
+                    "Running inside rootless podman user namespace: keyring unavailable. \
+                     Set DOCKER_CREDENTIAL_ICR_ALLOW_FILE_STORE=1 to enable file-store fallback."
+                        .to_string(),
+                ));
+            }
+            file_store_write(&self.registry, token).map_err(|e| {
+                CredentialError::TokenStoreError(format!("File store write failed: {}", e))
             })?;
-
-        // Store refresh token
-        if let Some(ref refresh_token) = token.refresh_token {
-            let refresh_entry = self.get_refresh_token_entry()?;
-            refresh_entry
-                .set_secret(refresh_token.as_bytes())
-                .map_err(|e| {
-                    CredentialError::TokenStoreError(format!(
-                        "Failed to store refresh token: {}",
-                        e
-                    ))
-                })?;
+            info!("Token stored in file store (podman userns) for: {}", self.registry);
+            info!("Token expires at: {}", token.expires_at);
+            return Ok(());
         }
 
-        // Store expiration time
-        let expires_rfc3339 = token.expires_at.to_rfc3339();
-        let expires_entry = self.get_expiration_entry()?;
-        expires_entry.set_password(&expires_rfc3339).map_err(|e| {
-            CredentialError::TokenStoreError(format!("Failed to store expiration: {}", e))
-        })?;
-        info!("Tokens stored successfully for registry: {}", self.registry);
+        // Attempt to store in the keyring.
+        // Note: IBM Cloud tokens are JWT tokens with around 1600 characters.
+        // The Windows Credential Manager can store up to 2560 bytes per
+        // credential. Since set_password() encodes as UTF-16 that caps at
+        // ~1280 characters, which isn't enough. set_secret() works around
+        // this. See CRED_MAX_CREDENTIAL_BLOB_SIZE at
+        // https://learn.microsoft.com/en-us/windows/win32/api/wincred/ns-wincred-credentialw
+        let keyring_ok = match Entry::new(SERVICE_NAME, &self.access_key()) {
+            Ok(e) => match e.set_secret(token.access_token.as_bytes()) {
+                Ok(()) => {
+                    if let Some(ref rt) = token.refresh_token {
+                        if let Ok(re) = Entry::new(SERVICE_NAME, &self.refresh_key()) {
+                            if let Err(e) = re.set_secret(rt.as_bytes()) {
+                                warn!("Failed to store refresh token in keyring: {}", e);
+                            }
+                        }
+                    }
+                    if let Ok(ee) = Entry::new(SERVICE_NAME, &self.expires_key()) {
+                        if let Err(e) = ee.set_password(&token.expires_at.to_rfc3339()) {
+                            warn!("Failed to store expiration in keyring: {}", e);
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        "Keyring write failed ({}), falling back to file store",
+                        e
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "Failed to create keyring entry ({}), falling back to file store",
+                    e
+                );
+                false
+            }
+        };
+
+        if !keyring_ok {
+            if !file_store_enabled() {
+                return Err(CredentialError::TokenStoreError(
+                    "Keyring unavailable and file-store fallback is not enabled \
+                     (DOCKER_CREDENTIAL_ICR_ALLOW_FILE_STORE not set)"
+                        .to_string(),
+                ));
+            }
+            debug!("Writing token to file store for: {}", self.registry);
+            file_store_write(&self.registry, token).map_err(|e| {
+                CredentialError::TokenStoreError(format!("File store write failed: {}", e))
+            })?;
+            info!("Tokens stored in file store for: {}", self.registry);
+        } else {
+            info!("Tokens stored in keyring for: {}", self.registry);
+        }
+
         info!("Token expires at: {}", token.expires_at);
         Ok(())
     }
 
-    /// Retrieve a token from the system keyring
+    /// Retrieve a token — keyring first, then file store.
     pub fn get_token(&self) -> Result<Option<StoredToken>> {
         debug!(
             "Attempting to retrieve token for registry: {}",
             self.registry
         );
 
-        // Try to get access token
-        let access_entry = self.get_access_token_entry()?;
-        let access_token = match access_entry.get_secret() {
-            Ok(bytes) => {
-                debug!("Successfully retrieved access token from keyring");
-                String::from_utf8(bytes).map_err(|e| {
-                    CredentialError::TokenStoreError(format!(
-                        "Failed to decode access token: {}",
-                        e
-                    ))
-                })?
-            }
-            Err(keyring::Error::NoEntry) => {
-                debug!(
-                    "No access token found in keyring for registry: {}",
-                    self.registry
-                );
+        // Skip the keyring entirely when running inside a rootless podman user
+        // namespace — go straight to the file store (or return None).
+        if inside_podman_userns() {
+            debug!("Inside podman userns: skipping keyring");
+            if !file_store_enabled() {
+                debug!("File store not enabled; no cached token available");
                 return Ok(None);
             }
-            Err(e) => {
-                warn!("Failed to retrieve access token from keyring: {}", e);
-                return Err(CredentialError::TokenStoreError(format!(
-                    "Failed to retrieve access token: {}",
-                    e
-                )));
-            }
-        };
+            debug!("Checking file store for: {}", self.registry);
+            return Ok(file_store_read(&self.registry));
+        }
 
-        // Try to get refresh token (optional)
-        let refresh_entry = self.get_refresh_token_entry()?;
-        let refresh_token = match refresh_entry.get_secret() {
-            Ok(bytes) => {
-                debug!("Successfully retrieved refresh token from keyring");
-                Some(String::from_utf8(bytes).map_err(|e| {
-                    CredentialError::TokenStoreError(format!(
-                        "Failed to decode refresh token: {}",
+        // Try keyring first.
+        if let Ok(access_entry) = Entry::new(SERVICE_NAME, &self.access_key()) {
+            match access_entry.get_secret() {
+                Ok(bytes) => {
+                    let access_token = match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err(CredentialError::TokenStoreError(format!(
+                                "Failed to decode access token: {}",
+                                e
+                            )))
+                        }
+                    };
+
+                    let refresh_token = Entry::new(SERVICE_NAME, &self.refresh_key())
+                        .ok()
+                        .and_then(|e| e.get_secret().ok())
+                        .and_then(|b| String::from_utf8(b).ok());
+
+                    let expires_at = match Entry::new(SERVICE_NAME, &self.expires_key())
+                        .ok()
+                        .and_then(|e| e.get_password().ok())
+                        .and_then(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }) {
+                        Some(dt) => dt,
+                        None => {
+                            warn!(
+                                "No valid expiration in keyring for {}, treating as expired",
+                                self.registry
+                            );
+                            return Ok(None);
+                        }
+                    };
+
+                    debug!("Token retrieved from keyring for: {}", self.registry);
+                    return Ok(Some(StoredToken {
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                    }));
+                }
+                Err(keyring::Error::NoEntry) => {
+                    debug!("No token in keyring for: {}", self.registry);
+                    // Fall through to file store.
+                }
+                Err(e) => {
+                    warn!(
+                        "Keyring read failed ({}); falling back to file store",
                         e
-                    ))
-                })?)
+                    );
+                    // Fall through to file store.
+                }
             }
-            Err(keyring::Error::NoEntry) => {
-                debug!("No refresh token found in keyring");
-                None
-            }
-            Err(e) => {
-                warn!("Failed to retrieve refresh token from keyring: {}", e);
-                None
-            }
-        };
+        }
 
-        // Try to get expiration time
-        let expires_entry = self.get_expiration_entry()?;
-        let expires_at = match expires_entry.get_password() {
-            Ok(expires_str) => {
-                debug!(
-                    "Successfully retrieved expiration from keyring: {}",
-                    expires_str
-                );
-                DateTime::parse_from_rfc3339(&expires_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .map_err(|e| {
-                        CredentialError::TokenStoreError(format!(
-                            "Failed to parse expiration: {}",
-                            e
-                        ))
-                    })?
-            }
-            Err(keyring::Error::NoEntry) => {
-                // If no expiration stored, assume token is expired
-                warn!("No expiration time found in keyring for stored token, assuming expired");
-                return Ok(None);
-            }
-            Err(e) => {
-                warn!("Failed to retrieve expiration from keyring: {}", e);
-                return Err(CredentialError::TokenStoreError(format!(
-                    "Failed to retrieve expiration: {}",
-                    e
-                )));
-            }
-        };
-
-        info!(
-            "Successfully retrieved complete token from keyring for registry: {}",
-            self.registry
-        );
-        debug!("Token expires at: {}", expires_at);
-
-        Ok(Some(StoredToken {
-            access_token,
-            refresh_token,
-            expires_at,
-        }))
+        // File store fallback.
+        if !file_store_enabled() {
+            debug!("File-store fallback not enabled for: {}", self.registry);
+            return Ok(None);
+        }
+        debug!("Checking file store for: {}", self.registry);
+        Ok(file_store_read(&self.registry))
     }
 
-    /// Delete a token from the system keyring
+    /// Delete a token from both keyring and file store.
     pub fn delete_token(&self) -> Result<()> {
-        let mut deleted = false;
-
-        // Delete access token
-        if let Ok(entry) = self.get_access_token_entry() {
-            match entry.delete_credential() {
-                Ok(()) => deleted = true,
-                Err(keyring::Error::NoEntry) => {}
-                Err(e) => warn!("Failed to delete access token: {}", e),
+        for key in &[self.access_key(), self.refresh_key(), self.expires_key()] {
+            if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(e) => warn!("Failed to delete keyring entry '{}': {}", key, e),
+                }
             }
         }
-
-        // Delete refresh token
-        if let Ok(entry) = self.get_refresh_token_entry() {
-            match entry.delete_credential() {
-                Ok(()) => deleted = true,
-                Err(keyring::Error::NoEntry) => {}
-                Err(e) => warn!("Failed to delete refresh token: {}", e),
-            }
+        if file_store_enabled() {
+            file_store_delete(&self.registry);
         }
-
-        // Delete expiration
-        if let Ok(entry) = self.get_expiration_entry() {
-            match entry.delete_credential() {
-                Ok(()) => deleted = true,
-                Err(keyring::Error::NoEntry) => {}
-                Err(e) => warn!("Failed to delete expiration: {}", e),
-            }
-        }
-
-        if deleted {
-            info!("Token deleted successfully for registry: {}", self.registry);
-        } else {
-            debug!("No token to delete for registry: {}", self.registry);
-        }
-
+        debug!("Token deleted for: {}", self.registry);
         Ok(())
     }
 
@@ -273,7 +359,6 @@ impl TokenStore {
             Some(token) => {
                 if token.is_expired() {
                     info!("Access token expired for registry: {}", self.registry);
-                    // Token is expired, try to refresh if we have a refresh token
                     if let Some(refresh_token) = &token.refresh_token {
                         info!("Attempting to refresh token");
                         match self.refresh_access_token(refresh_token).await {
@@ -283,20 +368,17 @@ impl TokenStore {
                             }
                             Err(e) => {
                                 warn!("Failed to refresh token: {}", e);
-                                // Delete the expired token
                                 let _ = self.delete_token();
                                 Ok(None)
                             }
                         }
                     } else {
                         info!("No refresh token available, need to re-authenticate");
-                        // No refresh token, delete expired token
                         let _ = self.delete_token();
                         Ok(None)
                     }
                 } else if token.expires_soon() {
                     info!("Access token expires soon for registry: {}", self.registry);
-                    // Token expires soon, try to refresh proactively
                     if let Some(refresh_token) = &token.refresh_token {
                         match self.refresh_access_token(refresh_token).await {
                             Ok(new_token) => {
@@ -308,16 +390,13 @@ impl TokenStore {
                                     "Failed to refresh token proactively, using existing token: {}",
                                     e
                                 );
-                                // Use existing token if refresh fails
                                 Ok(Some(token.access_token))
                             }
                         }
                     } else {
-                        // No refresh token, use existing token
                         Ok(Some(token.access_token))
                     }
                 } else {
-                    // Token is still valid
                     debug!("Using cached valid token");
                     Ok(Some(token.access_token))
                 }
@@ -337,10 +416,8 @@ impl TokenStore {
 
         debug!("Refreshing access token");
 
-        // Fetch OIDC configuration to get token endpoint
         let config = fetch_oidc_config().await?;
 
-        // Build refresh token request
         let client = reqwest::Client::new();
         let mut params = HashMap::new();
         params.insert("grant_type", "refresh_token");
@@ -348,7 +425,6 @@ impl TokenStore {
         params.insert("client_id", CLIENT_ID);
         params.insert("client_secret", CLIENT_SECRET);
 
-        // Send refresh token request
         let response = client
             .post(&config.token_endpoint)
             .form(&params)
@@ -367,7 +443,6 @@ impl TokenStore {
             )));
         }
 
-        // Parse response
         #[derive(Deserialize)]
         struct TokenResponse {
             access_token: String,
@@ -379,7 +454,6 @@ impl TokenStore {
             CredentialError::AuthenticationError(format!("Failed to parse token response: {}", e))
         })?;
 
-        // Store the new token
         let new_token = StoredToken::new(
             token_response.access_token.clone(),
             token_response
